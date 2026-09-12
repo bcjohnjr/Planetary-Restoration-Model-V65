@@ -1,0 +1,402 @@
+name: V65 Seven-Schedule Three-Model Generality
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  V622_COMMIT: "89a0f4ab18df25db3a05d4e39c6db06405456505"
+  FAIR_COMMIT: "ec46fefc8f8c6b560a8b78ab1f4a9a5e04537f79"
+  OSCAR_COMMIT: "3ce008400e06363564e5981a35cbc32377d41d86"
+  FAIR_SOURCE_DIR: /tmp/FAIR-v2.2.4
+
+jobs:
+  schedule-matrix:
+    name: ${{ matrix.case }} — FaIR + Hector + OSCAR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        case:
+          - canonical_peak15p2
+          - scaled_peak5p0
+          - scaled_peak10p0
+          - scaled_peak20p0
+          - same_total_uniform
+          - same_total_peak20_early
+          - same_total_peak20_late
+
+    steps:
+      - name: Checkout V65 experiment package
+        uses: actions/checkout@v7
+
+      - name: Restore pinned V62.2 validation base
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/V62.2
+          git clone https://github.com/bcjohnjr/Planetary-Restoration-Version-62.2.git /tmp/V62.2
+          git -C /tmp/V62.2 checkout --detach "$V622_COMMIT"
+          test "$(git -C /tmp/V62.2 rev-parse HEAD)" = "$V622_COMMIT"
+
+          cp /tmp/V62.2/external_validation_net_co2_trajectory.csv .
+          cp /tmp/V62.2/run_fair_matched_forcing_v62.py .
+          cp /tmp/V62.2/run_hector_matched_forcing_v62.R .
+          cp /tmp/V62.2/run_oscar_validation_v62.py .
+
+          echo "f2d58812b8c54bfc52da1dee360ca06f8ccfb888791cf3dc1105bc038ae3a637  external_validation_net_co2_trajectory.csv" | sha256sum -c -
+          test -f generate_schedule_matrix_v65.py
+          test -f patch_hector_v65.py
+          test -f compare_three_model_schedule_v65.py
+          test -f run_oscar_matched_forcing_v63.py
+
+      - name: Set up Python 3.12 for FaIR
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install FaIR 2.2.4 workload
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install fair==2.2.4 numpy pandas xarray scipy
+          python - <<'PY'
+          import fair
+          assert fair.__version__ == "2.2.4"
+          print("FaIR", fair.__version__)
+          PY
+
+      - name: Clone pinned official FaIR source
+        run: |
+          set -euo pipefail
+          rm -rf "$FAIR_SOURCE_DIR"
+          git clone --depth 1 --branch v2.2.4 https://github.com/OMS-NetZero/FAIR.git "$FAIR_SOURCE_DIR"
+          test "$(git -C "$FAIR_SOURCE_DIR" rev-parse HEAD)" = "$FAIR_COMMIT"
+          test -f "$FAIR_SOURCE_DIR/examples/data/calibrated_constrained_ensemble/calibrated_constrained_parameters_calibration1.4.1.csv"
+
+      - name: Generate seven predeclared trajectories
+        run: |
+          set -euo pipefail
+          rm -rf trajectories
+          python generate_schedule_matrix_v65.py \
+            --input external_validation_net_co2_trajectory.csv \
+            --outdir trajectories
+          test -f "trajectories/${{ matrix.case }}.csv"
+          test -f trajectories/manifest.json
+
+      - name: Stage schedule-specific FaIR experiment
+        run: |
+          set -euo pipefail
+          rm -rf fair_work
+          mkdir -p fair_work
+          cp "trajectories/${{ matrix.case }}.csv" fair_work/external_validation_net_co2_trajectory.csv
+          cp run_fair_matched_forcing_v62.py fair_work/
+          sed -i 's/^END_YEAR = 2300$/END_YEAR = 2183/' fair_work/run_fair_matched_forcing_v62.py
+          grep -q '^END_YEAR = 2183$' fair_work/run_fair_matched_forcing_v62.py
+          python -m py_compile fair_work/run_fair_matched_forcing_v62.py
+
+      - name: Run FaIR matched-forcing schedule experiment
+        run: |
+          set -euo pipefail
+          cd fair_work
+          set -o pipefail
+          python run_fair_matched_forcing_v62.py 2>&1 | tee FAIR_SCHEDULE_CONSOLE.log
+
+      - name: Verify FaIR schedule result
+        run: |
+          set -euo pipefail
+          cd fair_work
+          python - <<'PY'
+          import json
+          import numpy as np
+          import pandas as pd
+
+          s = json.load(open("fair_matched_summary.json", encoding="utf-8"))
+          tr = pd.read_csv("external_validation_net_co2_trajectory.csv")
+          forcing = pd.read_csv("fair_matched_nonco2_forcing.csv")
+          attr = pd.read_csv("fair_matched_attribution.csv")
+          ts = pd.read_csv("fair_matched_timeseries.csv")
+
+          assert s["model"] == "FaIR"
+          assert s["version"] == "2.2.4"
+          assert s["configs"] == 841
+          assert len(tr) == 158 and int(tr.year.iloc[0]) == 2026 and int(tr.year.iloc[-1]) == 2183
+          assert len(forcing) == 158 and int(forcing.year.iloc[0]) == 2026 and int(forcing.year.iloc[-1]) == 2183
+          assert len(ts) == 158 and int(ts.year.iloc[0]) == 2026 and int(ts.year.iloc[-1]) == 2183
+          assert int(round(float(attr.year.iloc[-1]))) == 2183
+
+          ident = tr.gross_co2_gtco2 + tr.permafrost_co2_gtco2 + tr.stored_carbon_reversal_gtco2 - tr.cdr_gtco2
+          assert float(np.max(np.abs(ident - tr.net_co2_gtco2))) < 1e-9
+          assert float(tr.cdr_gtco2.sum()) > 0
+          assert float(tr.cdr_gtco2.max()) <= 20.0 + 1e-9
+
+          tol = float(s["forcing_match_tolerance_wm2"])
+          assert float(s["forcing_match_max_abs_on_wm2"]) <= tol
+          assert float(s["forcing_match_max_abs_off_wm2"]) <= tol
+          assert float(s["forcing_match_on_vs_off_max_abs_wm2"]) <= 2 * tol
+          assert np.isfinite(forcing["matched_nonco2_forcing_wm2"].to_numpy(float)).all()
+          print("FaIR schedule gate passed; CDR total=", float(tr.cdr_gtco2.sum()))
+          PY
+
+      - name: Set up R 4.5.1
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.5.1"
+          use-public-rspm: true
+
+      - name: Install Hector 3.5.0
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev libboost-filesystem-dev libboost-system-dev
+          Rscript -e 'install.packages(c("Rcpp", "BH", "jsonlite"), repos="https://cloud.r-project.org")'
+          rm -rf /tmp/hector-v3.5.0
+          git clone --depth 1 --branch v3.5.0 https://github.com/JGCRI/hector.git /tmp/hector-v3.5.0
+          R CMD INSTALL --no-multiarch --with-keep.source /tmp/hector-v3.5.0
+          Rscript -e 'library(hector); stopifnot(as.character(packageVersion("hector")) == "3.5.0"); cat("Hector 3.5.0 verified\n")'
+
+      - name: Stage and patch schedule-specific Hector experiment
+        run: |
+          set -euo pipefail
+          rm -rf hector_work
+          mkdir -p hector_work
+          cp fair_work/external_validation_net_co2_trajectory.csv hector_work/
+          cp fair_work/fair_matched_nonco2_forcing.csv hector_work/
+          python patch_hector_v65.py \
+            run_hector_matched_forcing_v62.R \
+            hector_work/run_hector_matched_forcing_v65.R
+          if grep -q '2300' hector_work/run_hector_matched_forcing_v65.R; then
+            echo "ERROR: 2300 remains after Hector patch"
+            exit 1
+          fi
+          Rscript -e 'parse(file="hector_work/run_hector_matched_forcing_v65.R"); cat("Hector syntax OK\n")'
+
+      - name: Verify Hector inputs
+        run: |
+          set -euo pipefail
+          cd hector_work
+          Rscript - <<'RS'
+          traj <- read.csv("external_validation_net_co2_trajectory.csv", check.names=FALSE)
+          forcing <- read.csv("fair_matched_nonco2_forcing.csv", check.names=FALSE)
+          stopifnot(nrow(traj) == 158)
+          stopifnot(identical(as.numeric(traj$year), as.numeric(2026:2183)))
+          stopifnot(nrow(forcing) == 158)
+          stopifnot(identical(as.numeric(forcing$year), as.numeric(2026:2183)))
+          stopifnot(all(is.finite(forcing$matched_nonco2_forcing_wm2)))
+          mass <- traj$gross_co2_gtco2 + traj$permafrost_co2_gtco2 + traj$stored_carbon_reversal_gtco2 - traj$cdr_gtco2
+          stopifnot(max(abs(mass - traj$net_co2_gtco2)) < 1e-9)
+          stopifnot(sum(traj$cdr_gtco2) > 0)
+          stopifnot(max(traj$cdr_gtco2) <= 20.0 + 1e-9)
+          cat("Hector schedule inputs verified\n")
+          RS
+
+      - name: Run Hector matched-forcing schedule experiment
+        run: |
+          set -euo pipefail
+          cd hector_work
+          set -o pipefail
+          Rscript run_hector_matched_forcing_v65.R 2>&1 | tee HECTOR_SCHEDULE_CONSOLE.log
+
+      - name: Verify Hector schedule result
+        run: |
+          set -euo pipefail
+          cd hector_work
+          Rscript - <<'RS'
+          library(jsonlite)
+          s <- read_json("hector_matched_summary.json", simplifyVector=TRUE)
+          a <- read.csv("hector_matched_attribution.csv", check.names=FALSE)
+          stopifnot(nrow(a) == 157)
+          stopifnot(a$year[1] == 2027)
+          stopifnot(a$year[nrow(a)] == 2183)
+          stopifnot(all(is.finite(a$delta_co2_ppm)))
+          tol <- as.numeric(s$forcing_match_tolerance_wm2)
+          stopifnot(as.numeric(s$forcing_match_max_abs_on_wm2) <= tol)
+          stopifnot(as.numeric(s$forcing_match_max_abs_off_wm2) <= tol)
+          stopifnot(tail(a$delta_co2_ppm, 1) > 0)
+          cat("Hector schedule gate passed\n")
+          RS
+
+      - name: Set up Python 3.9 for OSCAR
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Install exact OSCAR v3.3 runtime dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade 'pip<25'
+          pip install \
+            'numpy==1.23.3' \
+            'scipy==1.9.3' \
+            'pandas==1.5.3' \
+            'xarray==0.20.1' \
+            'matplotlib==3.7.5' \
+            'netCDF4==1.6.5' \
+            'h5netcdf==1.3.0' \
+            'h5py==3.10.0'
+
+      - name: Fetch pinned official OSCAR v3.3 source
+        run: |
+          set -euo pipefail
+          rm -rf _oscar
+          git clone https://github.com/tgasser/OSCAR.git _oscar
+          git -C _oscar checkout --detach "$OSCAR_COMMIT"
+          test "$(git -C _oscar rev-parse HEAD)" = "$OSCAR_COMMIT"
+          python - <<'PY'
+          import xarray as xr
+          p = "_oscar/input_data/parameters/from_OSCARv2/ocean_CMIP5.nc"
+          with xr.open_dataset(p) as ds:
+              print("OSCAR NetCDF parameters verified; dims=", dict(ds.dims))
+          PY
+
+      - name: Run OSCAR matched-forcing and reservoir experiment
+        run: |
+          set -euo pipefail
+          rm -rf oscar_results
+          set -o pipefail
+          python run_oscar_matched_forcing_v63.py \
+            --oscar-root "$GITHUB_WORKSPACE/_oscar" \
+            --trajectory "$GITHUB_WORKSPACE/fair_work/external_validation_net_co2_trajectory.csv" \
+            --forcing-target "$GITHUB_WORKSPACE/fair_work/fair_matched_nonco2_forcing.csv" \
+            --outdir "$GITHUB_WORKSPACE/oscar_results" \
+            --nmc 200 \
+            --end-year 2183 \
+            --forcing-tol 1e-4 \
+            --max-iters 6 \
+            2>&1 | tee OSCAR_SCHEDULE_CONSOLE.log
+
+      - name: Verify OSCAR schedule result
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import numpy as np
+          import pandas as pd
+
+          s = json.load(open("oscar_results/oscar_matched_summary.json", encoding="utf-8"))
+          tr = pd.read_csv("fair_work/external_validation_net_co2_trajectory.csv")
+          a = pd.read_csv("oscar_results/oscar_matched_attribution.csv")
+          r = pd.read_csv("oscar_results/oscar_reservoir_decomposition.csv")
+          audit = pd.read_csv("oscar_results/oscar_forcing_match_audit.csv")
+
+          assert s["status"] == "PASS"
+          assert s["oscar_version"] == "v3.3"
+          assert s["oscar_pinned_commit"] == "3ce008400e06363564e5981a35cbc32377d41d86"
+          assert s["ensemble_members"] == 200
+          assert s["years"] == [2027, 2183]
+          assert all(bool(v) for v in s["gates"].values())
+          assert len(a) == 157 and int(a.year.iloc[0]) == 2027 and int(a.year.iloc[-1]) == 2183
+          assert len(r) == 157 and int(r.year.iloc[0]) == 2027 and int(r.year.iloc[-1]) == 2183
+          assert set(audit["case"]) == {"removal_ON", "removal_OFF"}
+          total = float(tr.cdr_gtco2.sum())
+          assert abs(float(s["canonical_cdr_2027_2183_gtco2"]) - total) < 1e-6
+          fp = s["forcing_protocol"]
+          assert float(fp["on_max_abs_median_error_wm2"]) <= float(fp["tolerance_wm2"])
+          assert float(fp["off_max_abs_median_error_wm2"]) <= float(fp["tolerance_wm2"])
+          assert np.isfinite(r.select_dtypes(include=["number"]).to_numpy(float)).all()
+          assert float(s["final_2183_delta_co2_p50_ppm"]) > 0
+          assert float(s["final_2183_response_fraction_p50"]) > 0
+          print("OSCAR schedule gate passed; CDR total=", total)
+          PY
+
+      - name: Build three-model schedule summary
+        run: |
+          set -euo pipefail
+          rm -rf case_results
+          mkdir -p case_results
+          python compare_three_model_schedule_v65.py \
+            --case "${{ matrix.case }}" \
+            --trajectory fair_work/external_validation_net_co2_trajectory.csv \
+            --fair fair_work/fair_matched_attribution.csv \
+            --fair-summary fair_work/fair_matched_summary.json \
+            --hector hector_work/hector_matched_attribution.csv \
+            --hector-summary hector_work/hector_matched_summary.json \
+            --oscar oscar_results/oscar_matched_attribution.csv \
+            --oscar-summary oscar_results/oscar_matched_summary.json \
+            --oscar-reservoir oscar_results/oscar_reservoir_decomposition.csv \
+            --output case_results/schedule_case_summary.json \
+            --milestones-output case_results/schedule_case_milestones.csv \
+            | tee THREE_MODEL_CASE_SUMMARY.log
+
+      - name: Upload schedule experiment artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: v65-schedule-${{ matrix.case }}
+          retention-days: 90
+          if-no-files-found: warn
+          path: |
+            trajectories/${{ matrix.case }}.csv
+            trajectories/manifest.json
+            fair_work/fair_matched_nonco2_forcing.csv
+            fair_work/fair_matched_attribution.csv
+            fair_work/fair_matched_timeseries.csv
+            fair_work/fair_matched_summary.json
+            fair_work/FAIR_SCHEDULE_CONSOLE.log
+            hector_work/hector_matched_attribution.csv
+            hector_work/hector_matched_timeseries.csv
+            hector_work/hector_matched_summary.json
+            hector_work/HECTOR_SCHEDULE_CONSOLE.log
+            oscar_results/oscar_matched_attribution.csv
+            oscar_results/oscar_matched_timeseries.csv
+            oscar_results/oscar_matched_summary.json
+            oscar_results/oscar_reservoir_decomposition.csv
+            oscar_results/oscar_forcing_match_audit.csv
+            OSCAR_SCHEDULE_CONSOLE.log
+            case_results/schedule_case_summary.json
+            case_results/schedule_case_milestones.csv
+            THREE_MODEL_CASE_SUMMARY.log
+
+  synthesize:
+    name: Synthesize V65 seven-schedule matrix
+    needs: schedule-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout V65 experiment package
+        uses: actions/checkout@v7
+
+      - name: Download all seven schedule artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: v65-schedule-*
+          path: experiment_artifacts
+          merge-multiple: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install synthesis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas
+
+      - name: Synthesize three-model schedule matrix
+        run: |
+          set -euo pipefail
+          rm -rf v65_results
+          python synthesize_schedule_matrix_v65.py \
+            --root experiment_artifacts \
+            --outdir v65_results \
+            | tee V65_SYNTHESIS_CONSOLE.log
+
+      - name: Show synthesis
+        run: |
+          cat v65_results/V65_THREE_MODEL_SCHEDULE_RESULTS.md
+
+      - name: Upload V65 synthesis artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: V65-Seven-Schedule-Three-Model-Synthesis
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            v65_results/
+            V65_SYNTHESIS_CONSOLE.log
