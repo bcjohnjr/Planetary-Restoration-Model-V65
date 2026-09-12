@@ -207,17 +207,41 @@ jobs:
           cd hector_work
           Rscript - <<'RS'
           library(jsonlite)
+
           s <- read_json("hector_matched_summary.json", simplifyVector=TRUE)
           a <- read.csv("hector_matched_attribution.csv", check.names=FALSE)
-          stopifnot(nrow(a) == 157)
-          stopifnot(a$year[1] == 2027)
+
+          # Hector includes the 2026 initialization/output year.
+          stopifnot(nrow(a) == 158)
+          stopifnot(a$year[1] == 2026)
           stopifnot(a$year[nrow(a)] == 2183)
           stopifnot(all(is.finite(a$delta_co2_ppm)))
+
+          # Common three-model comparison window is 2027-2183.
+          a_eval <- subset(a, year >= 2027 & year <= 2183)
+
+          stopifnot(nrow(a_eval) == 157)
+          stopifnot(a_eval$year[1] == 2027)
+          stopifnot(a_eval$year[nrow(a_eval)] == 2183)
+          stopifnot(all(is.finite(a_eval$delta_co2_ppm)))
+
           tol <- as.numeric(s$forcing_match_tolerance_wm2)
+
           stopifnot(as.numeric(s$forcing_match_max_abs_on_wm2) <= tol)
           stopifnot(as.numeric(s$forcing_match_max_abs_off_wm2) <= tol)
-          stopifnot(tail(a$delta_co2_ppm, 1) > 0)
+          stopifnot(tail(a_eval$delta_co2_ppm, 1) > 0)
+
           cat("Hector schedule gate passed\n")
+          cat(
+            "Raw Hector years:",
+            min(a$year), "-", max(a$year),
+            "rows:", nrow(a), "\n"
+          )
+          cat(
+            "Comparison years:",
+            min(a_eval$year), "-", max(a_eval$year),
+            "rows:", nrow(a_eval), "\n"
+          )
           RS
 
       - name: Set up Python 3.9 for OSCAR
@@ -292,14 +316,18 @@ jobs:
           assert len(a) == 157 and int(a.year.iloc[0]) == 2027 and int(a.year.iloc[-1]) == 2183
           assert len(r) == 157 and int(r.year.iloc[0]) == 2027 and int(r.year.iloc[-1]) == 2183
           assert set(audit["case"]) == {"removal_ON", "removal_OFF"}
+
           total = float(tr.cdr_gtco2.sum())
           assert abs(float(s["canonical_cdr_2027_2183_gtco2"]) - total) < 1e-6
+
           fp = s["forcing_protocol"]
           assert float(fp["on_max_abs_median_error_wm2"]) <= float(fp["tolerance_wm2"])
           assert float(fp["off_max_abs_median_error_wm2"]) <= float(fp["tolerance_wm2"])
+
           assert np.isfinite(r.select_dtypes(include=["number"]).to_numpy(float)).all()
           assert float(s["final_2183_delta_co2_p50_ppm"]) > 0
           assert float(s["final_2183_response_fraction_p50"]) > 0
+
           print("OSCAR schedule gate passed; CDR total=", total)
           PY
 
@@ -308,6 +336,7 @@ jobs:
           set -euo pipefail
           rm -rf case_results
           mkdir -p case_results
+
           python compare_three_model_schedule_v65.py \
             --case "${{ matrix.case }}" \
             --trajectory fair_work/external_validation_net_co2_trajectory.csv \
@@ -382,6 +411,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf v65_results
+
           python synthesize_schedule_matrix_v65.py \
             --root experiment_artifacts \
             --outdir v65_results \
